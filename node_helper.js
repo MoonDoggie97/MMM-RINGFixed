@@ -75,99 +75,69 @@ module.exports = NodeHelper.create({
   },
 
   monitorRingActivity: async function () {
-    this.ringApi = new mainRingApi.RingApi({
-      refreshToken: process.env.RING_2FA_REFRESH_TOKEN,
-      debug: true,
-      cameraDingsPollingSeconds: 2
-    });
-
-    this.ringApi.onRefreshTokenUpdated.subscribe(
-      async ({ newRefreshToken, oldRefreshToken }) => {
-        this.toLog("Refresh Token Updated");
-
-        if (!oldRefreshToken) {
-          return;
-        }
-
-        const currentConfig = await util.promisify(fs.readFile)(this.envFile);
-        const updateConfig = currentConfig
-          .toString()
-          .replace(oldRefreshToken, newRefreshToken);
-        await util.promisify(fs.writeFile)(this.envFile, updateConfig);
-      }
-    );
-
-    const locations = await this.ringApi.getLocations();
-    const allCameras = await this.ringApi.getCameras();
-
-    this.toLog(
-      `Found ${locations.length} location(s) with ${allCameras.length} camera(s).`
-    );
-
-    for (const location of locations) {
-      location.onConnected.pipe(operators.skip(1)).subscribe((connected) => {
-        const status = connected ? "Connected to" : "Disconnected from";
-        this.toLog(
-          `**** ${status} location ${location.locationDetails.name} - ${location.locationId}`
-        );
+    try {
+      // Initialize Ring API with the refresh token
+      this.ringApi = new mainRingApi.RingApi({
+        refreshToken: process.env.RING_2FA_REFRESH_TOKEN,
+        debug: true,
+        // Camera settings are now handled differently
+        cameraStatusPollingSeconds: 20,
+        locationModePollingSeconds: 20
       });
-    }
 
-    for (const location of locations) {
-      const cameras = location.cameras,
-        devices = await location.getDevices();
+      // Handle token refresh
+      this.ringApi.onRefreshTokenUpdated.subscribe(
+        async ({ newRefreshToken, oldRefreshToken }) => {
+          this.toLog("Refresh Token Updated");
+          if (!oldRefreshToken) return;
 
-      this.toLog(
-        `Location ${location.locationDetails.name} has the following ${cameras.length} camera(s):`
-      );
-
-      for (const camera of cameras) {
-        this.toLog(`- ${camera.id}: ${camera.name} (${camera.deviceType})`);
-      }
-
-      this.toLog(
-        `Location ${location.locationDetails.name} has the following ${devices.length} device(s):`
-      );
-
-      for (const device of devices) {
-        this.toLog(`- ${device.zid}: ${device.name} (${device.deviceType})`);
-      }
-    }
-
-    if (allCameras === undefined || allCameras.length == 0) {
-      this.toLog(
-        `no cameras were found! Ensure you have a camera on your account or that you provided accurate login information in the config. You'll need to restart MagicMirror.`
-      );
-      this.sendSocketNotification(
-        "DISPLAY_ERROR",
-        "No cameras were found! Check console for more info."
-      );
-      return;
-    }
-
-    // Start listening for doorbell presses on each camera
-    allCameras.forEach((camera) => {
-      camera.onDoorbellPressed.subscribe(async () => {
-        if (!this.sipSession) {
-          await this.startSession(camera, "ring");
+          const currentConfig = await util.promisify(fs.readFile)(this.envFile);
+          const updateConfig = currentConfig
+            .toString()
+            .replace(oldRefreshToken, newRefreshToken);
+          await util.promisify(fs.writeFile)(this.envFile, updateConfig);
         }
-      });
-      this.toLog(`Actively listening for doorbell presses`);
-      //Check config value if node app should stream motion
-      if(this.config.ringStreamMotion){
-        camera.onMotionDetected.subscribe(async (newMotion) => {
-          //NewMotion is a true false value indicating whether the motion is new based on the dings made in the last 65 seconds
-          // This prevents the stream from being triggered on startup because it would not be an active motion event.
-          if (!this.sipSession && newMotion) {
-            await this.startSession(camera, "motion");
+      );
+
+      // Get locations and cameras
+      const locations = await this.ringApi.getLocations();
+      const allCameras = await this.ringApi.getCameras();
+
+      this.toLog(
+        `Found ${locations.length} location(s) with ${allCameras.length} camera(s).`
+      );
+
+      // Set up camera event listeners
+      for (const camera of allCameras) {
+        // New way to handle doorbell events
+        camera.onDoorbellPressed.subscribe(async () => {
+          if (!this.sipSession) {
+            await this.startSession(camera, "ring");
           }
         });
-        this.toLog(`Actively listening for Motion events`);
-      }
-      
-    });
 
-    
+        // Handle motion events if enabled
+        if (this.config.ringStreamMotion) {
+          camera.onMotionDetected.subscribe(async (motion) => {
+            if (!this.sipSession && motion) {
+              await this.startSession(camera, "motion");
+            }
+          });
+        }
+
+        // Set up live streaming
+        camera.subscribeToMotionEvents().subscribe((motion) => {
+          this.toLog(`Motion detected on ${camera.name}: ${motion}`);
+        });
+      }
+
+    } catch (error) {
+      this.toLog(`Error in monitorRingActivity: ${error.message}`);
+      this.sendSocketNotification(
+        "DISPLAY_ERROR",
+        "Failed to initialize Ring connection. Check your refresh token."
+      );
+    }
   },
 
   startSession: async function (camera, type) {
@@ -176,51 +146,45 @@ module.exports = NodeHelper.create({
     }
 
     this.sessionRunning = true;
-    if(type === "ring"){
-      this.toLog(`${camera.name} had its doorbell rung! Preparing video stream.`);
-    }else if(type === "motion"){
-      this.toLog(`${camera.name} has sensed motion Preparing video stream.`);
-    }else{
-      this.toLog(`${camera.name} been summoned by something other than a ring or motion. (spooky) Preparing video stream.`); 
-    }
-    
+    this.toLog(`${camera.name} ${type === "ring" ? "doorbell pressed" : "motion detected"}. Preparing stream.`);
 
     await this.cleanUpVideoStreamDirectory();
     this.watchForStreamStarted();
 
     const streamTimeOut = this.config.ringMinutesToStreamVideo * 60 * 1000;
-    this.sipSession = await camera.streamVideo({
-      output: [
-        "-preset",
-        "veryfast",
-        "-g",
-        "25",
-        "-sc_threshold",
-        "0",
-        "-f",
-        "hls",
-        "-hls_time",
-        "2",
-        "-hls_list_size",
-        "6",
-        "-hls_flags",
-        "delete_segments",
-        pathApi.join(this.videoOutputDirectory, this.audioPlaylistFile)
-      ]
-    });
-    this.sipSession.onCallEnded.subscribe(() => {
-      this.toLog(`${camera.name} video stream has ended`);
-      this.sendSocketNotification("VIDEO_STREAM_ENDED", null);
-      this.stopWatchingFile();
-      this.sipSession = null;
+    
+    try {
+      this.sipSession = await camera.createRtpStreamingSession({
+        output: [
+          "-preset", "veryfast",
+          "-g", "25",
+          "-sc_threshold", "0",
+          "-f", "hls",
+          "-hls_time", "2",
+          "-hls_list_size", "6",
+          "-hls_flags", "delete_segments",
+          pathApi.join(this.videoOutputDirectory, this.audioPlaylistFile)
+        ]
+      });
+
+      this.sipSession.onCallEnded.subscribe(() => {
+        this.toLog(`${camera.name} video stream has ended`);
+        this.sendSocketNotification("VIDEO_STREAM_ENDED", null);
+        this.stopWatchingFile();
+        this.sipSession = null;
+        this.sessionRunning = false;
+      });
+
+      setTimeout(() => {
+        if (this.sipSession) {
+          this.sipSession.stop();
+        }
+      }, streamTimeOut);
+
+    } catch (error) {
+      this.toLog(`Error starting stream: ${error.message}`);
       this.sessionRunning = false;
-    });
-    setTimeout(() => {
-      this.toLog(`timeout hit`);
-      if (this.sipSession) {
-        this.sipSession.stop();
-      }
-    }, streamTimeOut);
+    }
   },
 
   stopWatchingFile: function () {
