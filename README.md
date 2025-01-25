@@ -21,12 +21,12 @@ Whenever someone rings your doorbell by pressing the button on your ring device,
 1. Install ffmpeg if it isn't already installed. You need to install ffmpeg-for-homebridge to support audio.
 
 ```
-sudo curl -Lf# https://github.com/homebridge/ffmpeg-for-homebridge/releases/latest/download/ffmpeg-raspbian-armv6l.tar.gz | sudo tar xzf - -C / --no-same-owner
+sudo curl -Lf# https://github.com/homebridge/ffmpeg-for-homebridge/releases/download/v0.1.0/ffmpeg-raspbian-armv6l.tar.gz | sudo tar xzf - -C / --no-same-owner
 
 ```
 
 2. Using the terminal, navigate to your `MagicMirror/modules` folder
-3. Execute: `git clone https://github.com/DustinBryant/MMM-Ring.git`
+3. Execute: `git clone https://github.com/MoonDoggie97/MMM-RINGFixed.git`
 4. Navigate to this new folder `cd MMM-Ring`
 5. Execute: `npm install`
 
